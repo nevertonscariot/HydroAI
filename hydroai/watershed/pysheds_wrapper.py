@@ -7,9 +7,12 @@ from typing import Tuple, Optional
 import logging
 import numpy as np
 import geopandas as gpd
+from shapely.geometry import shape
 import rasterio
-from rasterio.plot import show
+from rasterio.transform import Affine
 from pysheds.grid import Grid
+import tempfile
+import os
 
 class PySheksWrapper:
     """
@@ -24,6 +27,7 @@ class PySheksWrapper:
         self.dem = None
         self.fdir = None
         self.acc = None
+        self.dem_path = None
         
     def load_dem(self, dem_path: Path) -> Grid:
         """
@@ -33,17 +37,11 @@ class PySheksWrapper:
         -----------
         dem_path : Path
             Caminho para arquivo DEM (GeoTIFF)
-            Pode ser: SRTM, MERIT, GEBCO, etc
             
         Returns:
         --------
         Grid
             Grid object do PySheds
-            
-        Exemplo:
-        --------
-        wrapper = PySheksWrapper()
-        grid = wrapper.load_dem(Path('data/srtm_30s.tif'))
         """
         dem_path = Path(dem_path)
         
@@ -51,6 +49,7 @@ class PySheksWrapper:
             raise FileNotFoundError(f"DEM não encontrado: {dem_path}")
         
         self.logger.info(f"Carregando DEM: {dem_path}")
+        self.dem_path = dem_path
         
         try:
             # Carrega grid a partir do DEM
@@ -70,18 +69,11 @@ class PySheksWrapper:
     def preprocess_dem(self) -> np.ndarray:
         """
         Pré-processa DEM (preenche depressões, etc)
-        Etapa essencial para melhorar delimitação
         
         Returns:
         --------
         ndarray
             DEM processado
-            
-        Explicação:
-        -----------
-        1. fill_pits: Remove poços (depressões pequenas)
-        2. fill_depressions: Remove depressões maiores
-        3. resolve_flats: Resolve áreas planas
         """
         if self.dem is None:
             raise ValueError("Carregue DEM primeiro com load_dem()")
@@ -122,27 +114,18 @@ class PySheksWrapper:
         --------
         ndarray
             Matriz de direção de fluxo (D8 routing)
-            
-        Valores (D8):
-        - 1: direita
-        - 2: diagonal inferior-direita
-        - 4: inferior
-        - 8: diagonal inferior-esquerda
-        - 16: esquerda
-        - 32: diagonal superior-esquerda
-        - 64: superior
-        - 128: diagonal superior-direita
         """
         self.logger.info("Calculando direção de fluxo...")
         
         try:
             # Routing D8 (8 direções)
             fdir = self.grid.flowdir(dem_conditioned, routing='d8')
-            self.fdir = fdir
+            # Converte para numpy array
+            self.fdir = np.asarray(fdir)
             
             self.logger.info("Direção de fluxo calculada")
             
-            return fdir
+            return self.fdir
             
         except Exception as e:
             self.logger.error(f"Erro ao calcular direção: {e}")
@@ -151,12 +134,11 @@ class PySheksWrapper:
     def calculate_flow_accumulation(self) -> np.ndarray:
         """
         Calcula acumulação de fluxo (Flow Accumulation)
-        Número de células que drenam para cada célula
         
         Returns:
         --------
         ndarray
-            Matriz de acumulação (quanto maior, mais concentrado o fluxo)
+            Matriz de acumulação
         """
         if self.fdir is None:
             raise ValueError("Calcule direção de fluxo primeiro")
@@ -165,13 +147,14 @@ class PySheksWrapper:
         
         try:
             acc = self.grid.accumulation(self.fdir, routing='d8')
-            self.acc = acc
+            # Converte para numpy array
+            self.acc = np.asarray(acc)
             
             self.logger.info("Acumulação calculada")
-            self.logger.info(f"  - Valor máximo: {np.nanmax(acc)}")
-            self.logger.info(f"  - Valor mínimo: {np.nanmin(acc)}")
+            self.logger.info(f"  - Valor máximo: {np.nanmax(self.acc)}")
+            self.logger.info(f"  - Valor mínimo: {np.nanmin(self.acc)}")
             
-            return acc
+            return self.acc
             
         except Exception as e:
             self.logger.error(f"Erro ao calcular acumulação: {e}")
@@ -194,24 +177,16 @@ class PySheksWrapper:
         dem_path : Path
             Caminho para arquivo DEM
         output_path : Path, optional
-            Diretório para salvar shapefile da bacia
+            Diretório para salvar shapefiles
             
         Returns:
         --------
         GeoDataFrame
             Polígono da bacia delimitada
-            
-        Exemplo:
-        --------
-        wrapper = PySheksWrapper()
-        watershed = wrapper.delineate_watershed(
-            lat=-29.409,
-            lon=-56.737,
-            dem_path=Path('data/srtm.tif'),
-            output_path=Path('results/bacia')
-        )
         """
         self.logger.info(f"Delimitando bacia para ponto: ({lat}, {lon})")
+        
+        temp_file = None
         
         try:
             # 1. Carrega DEM
@@ -236,56 +211,156 @@ class PySheksWrapper:
                 y=row,
                 fdir=self.fdir,
                 routing='d8',
-                xytype='index'  # Usando índices
+                xytype='index'
             )
             
-            # 6. Extrai polígono
+            # 6. Salva catch em arquivo temporário PRIMEIRO
+            self.logger.info("Salvando resultado intermediário...")
+            
+            # Cria arquivo temporário
+            fd, temp_file = tempfile.mkstemp(suffix='.tif')
+            os.close(fd)
+            
+            # Converte catch para numpy array
+            catch_array = np.asarray(catch, dtype=np.float32)
+            
+            
+            # Obtém metadados do DEM original
+            with rasterio.open(str(dem_path)) as src:
+                transform = src.transform
+                crs = src.crs
+                profile = src.profile
+            
+            # Atualiza profile para o resultado
+            profile.update({
+                'dtype': rasterio.float32,
+                'count': 1,
+                'compress': 'deflate',
+                'nodata': None  # Remove nodata value
+            })
+
+            
+            # Salva array temporário
+            with rasterio.open(temp_file, 'w', **profile) as dst:
+                dst.write(catch_array, 1)
+            
+            self.logger.info(f"  - Arquivo temporário: {temp_file}")
+            
+            # 7. Lê arquivo temporário e vectoriza
             self.logger.info("Extraindo geometria...")
-            self.grid.clip_to(catch)
-            clipped_catch = self.grid.view(catch)
             
-            # 7. Converte para GeoDataFrame
-            shapes = self.grid.polygonize(clipped_catch > 0)
+            import rasterio.features
+            
+            with rasterio.open(temp_file) as src:
+                catch_data = src.read(1)
+                transform = src.transform
+                crs = src.crs
+            
+            # Cria máscara (apenas valores > 0)
+            catch_mask = (catch_data > 0).astype(np.uint8)
+            
+            self.logger.info(f"  - Máscara criada: {catch_mask.shape}")
+            self.logger.info(f"  - Pixels da bacia: {np.sum(catch_mask)}")
+            
+            # Vectoriza
+            shapes_list = list(rasterio.features.shapes(
+                catch_mask,
+                transform=transform
+            ))
+            
+            if not shapes_list:
+                raise ValueError("Nenhuma geometria foi criada")
+            
+            self.logger.info(f"  - {len(shapes_list)} shapes encontrados")
+            
+            # 8. Filtra apenas polígonos válidos
+            valid_shapes = []
+            for geom, value in shapes_list:
+                if value == 1:
+                    try:
+                        geom_obj = shape(geom)
+                        if geom_obj.is_valid and geom_obj.area > 0:
+                            valid_shapes.append(geom_obj)
+                    except Exception as e:
+                        self.logger.warning(f"  - Shape inválido: {e}")
+            
+            if not valid_shapes:
+                raise ValueError("Nenhum polígono válido encontrado")
+            
+            self.logger.info(f"  - {len(valid_shapes)} polígonos válidos")
+            
+            # 9. Combina polígonos
+            from shapely.ops import unary_union
+            if len(valid_shapes) == 1:
+                final_geom = valid_shapes[0]
+            else:
+                final_geom = unary_union(valid_shapes)
+            
+            # 10. Cria GeoDataFrame
             watershed_gdf = gpd.GeoDataFrame(
-                [1],
-                geometry=[shapes[0]],
-                crs=self.grid.crs,
-                columns=['id']
+                [{'id': 1}],
+                geometry=[final_geom],
+                crs=crs
             )
             
-            # 8. Calcula estatísticas
+            # 11. Calcula estatísticas
             area_m2 = watershed_gdf.geometry.area.sum()
             area_km2 = area_m2 / 1_000_000
             
-            self.logger.info(f"✓ Bacia delimitada com sucesso!")
-            self.logger.info(f"  - Área: {area_km2:.2f} km²")
-            self.logger.info(f"  - CRS: {watershed_gdf.crs}")
+            self.logger.info("=" * 70)
+            self.logger.info(f"✓ BACIA DELIMITADA COM SUCESSO!")
+            self.logger.info("=" * 70)
+            self.logger.info(f"  Área: {area_km2:.2f} km²")
+            self.logger.info(f"  Área: {area_m2/10000:.2f} ha")
+            self.logger.info(f"  CRS: {crs}")
+            self.logger.info("=" * 70)
             
-            # 9. Salva resultado se solicitado
+            # 12. Salva resultado se solicitado
             if output_path:
                 output_path = Path(output_path)
                 output_path.mkdir(parents=True, exist_ok=True)
                 
-                # Salva como shapefile
-                shapefile_path = output_path / 'watershed.shp'
-                watershed_gdf.to_file(shapefile_path)
-                self.logger.info(f"Shapefile salvo: {shapefile_path}")
+                try:
+                    shapefile_path = output_path / 'watershed.shp'
+                    watershed_gdf.to_file(shapefile_path)
+                    self.logger.info(f"✓ Shapefile salvo: {shapefile_path}")
+                except Exception as e:
+                    self.logger.warning(f"Erro ao salvar shapefile: {e}")
                 
-                # Salva como GeoPackage
-                gpkg_path = output_path / 'watershed.gpkg'
-                watershed_gdf.to_file(gpkg_path, driver='GPKG')
-                self.logger.info(f"GeoPackage salvo: {gpkg_path}")
+                try:
+                    gpkg_path = output_path / 'watershed.gpkg'
+                    watershed_gdf.to_file(gpkg_path, driver='GPKG')
+                    self.logger.info(f"✓ GeoPackage salvo: {gpkg_path}")
+                except Exception as e:
+                    self.logger.warning(f"Erro ao salvar GeoPackage: {e}")
                 
-                # Salva como GeoJSON
-                geojson_path = output_path / 'watershed.geojson'
-                watershed_gdf.to_file(geojson_path, driver='GeoJSON')
-                self.logger.info(f"GeoJSON salvo: {geojson_path}")
+                try:
+                    geojson_path = output_path / 'watershed.geojson'
+                    watershed_gdf.to_file(geojson_path, driver='GeoJSON')
+                    self.logger.info(f"✓ GeoJSON salvo: {geojson_path}")
+                except Exception as e:
+                    self.logger.warning(f"Erro ao salvar GeoJSON: {e}")
             
             return watershed_gdf
             
         except Exception as e:
-            self.logger.error(f"Erro ao delimitar bacia: {e}")
+            self.logger.error("=" * 70)
+            self.logger.error(f"❌ ERRO AO DELIMITAR BACIA")
+            self.logger.error("=" * 70)
+            self.logger.error(f"Erro: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self.logger.error("=" * 70)
             raise
+        
+        finally:
+            # Limpa arquivo temporário
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    self.logger.info("Arquivo temporário removido")
+                except:
+                    pass
     
     def get_watershed_stats(self, watershed_gdf: gpd.GeoDataFrame) -> dict:
         """
@@ -305,7 +380,7 @@ class PySheksWrapper:
             'area_km2': area_m2 / 1_000_000,
             'perimeter_m': perimeter_m,
             'perimeter_km': perimeter_m / 1_000,
-            'bounds': watershed_gdf.total_bounds,  # [minx, miny, maxx, maxy]
+            'bounds': watershed_gdf.total_bounds,
             'crs': watershed_gdf.crs
         }
         

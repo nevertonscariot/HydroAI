@@ -309,40 +309,105 @@ class MainWindow(QMainWindow):
         """Baixa DEM automaticamente"""
         from hydroai.watershed.downloader import DEMDownloader
         
-        dem_types = {
-            0: 'SRTM30',
-            1: 'SRTM90',
-            2: 'MERIT',
-            3: 'COPERNICUS'
-        }
+    def download_dem(self):
+        """Baixa DEM com suporte a OpenTopography"""
+        from hydroai.watershed.dem_downloader import DEMDownloader
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QComboBox, QSpinBox, QHBoxLayout
         
-        dem_type = dem_types[self.dem_type.currentIndex()]
-        lat = self.lat_input.value()
-        lon = self.lon_input.value()
-        buffer_km = self.buffer_spinbox.value()
+        # Dialog para configurar download
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configurar Download de DEM")
+        dialog.setGeometry(200, 200, 500, 300)
         
-        self._log(f"Iniciando download {dem_type}...")
-        self.progress_bar.setValue(50)
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
         
-        try:
-            downloader = DEMDownloader()
-            dem_path = downloader.download_dem(
-                lat=lat,
-                lon=lon,
-                buffer_km=buffer_km,
-                output_dir=Path('data/dem'),
-                dem_type=dem_type
-            )
+        # Título
+        title = QLabel("⚙️ Configurar Download de DEM")
+        title_font = title.font()
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+        
+        # Dataset
+        layout.addWidget(QLabel("Dataset:"))
+        combo_dataset = QComboBox()
+        combo_dataset.addItems(['SRTMGL1 (30m) ⭐', 'SRTMGL3 (90m)', 'ASTER (30m)', 'ALOS (30m)'])
+        layout.addWidget(combo_dataset)
+        
+        # Buffer
+        layout.addWidget(QLabel("Área de Download (buffer em km):"))
+        spin_buffer = QSpinBox()
+        spin_buffer.setRange(5, 100)
+        spin_buffer.setValue(25)
+        layout.addWidget(spin_buffer)
+        
+        # Info
+        info_text = QLabel(
+            "ℹ️ IMPORTANTE:\n"
+            "• Com API Key: Download direto e rápido\n"
+            "• Sem API Key: Usa OpenElevation (mais lento)\n\n"
+            "Obtenha sua API Key em:\n"
+            "https://portal.opentopography.org/myot"
+        )
+        info_text.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        layout.addWidget(info_text)
+        
+        # Botão de download
+        def do_download():
+            datasets = ['SRTMGL1', 'SRTMGL3', 'ASTER', 'AW3D30']
+            dataset = datasets[combo_dataset.currentIndex()]
+            buffer_km = spin_buffer.value()
             
-            self._log(f"✓ Download iniciado!")
-            self._log(f"  Acesse: https://code.earthengine.google.com/tasks")
-            self._log(f"  Clique em RUN para confirmar")
+            lat = self.lat_input.value()
+            lon = self.lon_input.value()
+            output_dir = Path('data/dem')
             
-            self.progress_bar.setValue(100)
+            self._log(f"🔄 Iniciando download...")
+            self._log(f"  Dataset: {dataset}")
+            self._log(f"  Coordenadas: ({lat}, {lon})")
+            self._log(f"  Buffer: {buffer_km}km")
+            self.progress_bar.setValue(25)
             
-        except Exception as e:
-            QMessageBox.critical(self, "Erro", f"Erro ao baixar DEM: {e}")
-            self.progress_bar.setValue(0)
+            try:
+                downloader = DEMDownloader()
+                
+                self._log(f"Conectando ao servidor...")
+                dem_path = downloader.download_dem(
+                    lat, lon, output_dir,
+                    buffer_km=buffer_km,
+                    dataset=dataset
+                )
+                
+                self._log(f"✓ Download concluído com sucesso!")
+                self._log(f"  Arquivo: {dem_path.name}")
+                self.current_dem_path = dem_path
+                self.progress_bar.setValue(100)
+                
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self, 
+                    "✓ Sucesso", 
+                    f"DEM baixado com sucesso!\n\n{dem_path}"
+                )
+                
+                dialog.accept()
+                
+            except Exception as e:
+                self._log(f"❌ Erro: {str(e)}")
+                self.progress_bar.setValue(0)
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "❌ Erro", f"Erro ao baixar:\n{e}")
+        
+        btn_download = QPushButton("⬇️ Baixar Agora")
+        btn_download.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px; font-weight: bold;")
+        btn_download.clicked.connect(do_download)
+        layout.addWidget(btn_download)
+        
+        layout.addStretch()
+        
+        dialog.exec_()
+
     
     def load_dem_local(self):
         """Carrega DEM local"""
